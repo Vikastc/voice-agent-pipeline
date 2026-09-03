@@ -4,7 +4,7 @@
 //   2. Sustained speech >= 2.5s   -> interrupt (word gaps do NOT reset the clock).
 //   3. Cough now + noise 3s later -> still NO interrupt (not continuous speech).
 const assert = require('assert');
-const { bargeInTimingAction, BARGE_IN } = require('./app.js');
+const { bargeInTimingAction, BARGE_IN } = require('./public/app.js');
 
 // Mirrors the burst bookkeeping in startBargeInMonitor's tick().
 function simulate(frames) {

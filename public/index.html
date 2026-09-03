@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Voice Agent — talk to me</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header>
+        <h1>🎙️ Voice Agent</h1>
+        <p class="subtitle">Click the mic, then just talk. Interrupt me anytime — I'll listen, answer, and finish my point.</p>
+      </header>
+
+      <button id="micBtn" aria-label="Start the voice agent">
+        <span class="mic-icon">🎙️</span>
+      </button>
+      <div id="status" class="status">Tap the mic to start</div>
+
+      <div id="messages" class="messages" aria-live="polite"></div>
+
+      <p class="hint">
+        Try: interrupt me with a question while I'm talking, or just say “okay” —
+        I'll pause, listen, and pick up where I left off.
+      </p>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>

@@ -1,5 +1,16 @@
 {
   "name": "voice-agent-production",
   "version": "1.0.0",
-  "private": true
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node bargeIn.test.js"
+  },
+  "dependencies": {
+    "express": "^4.22.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
 }
