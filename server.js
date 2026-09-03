@@ -42,8 +42,17 @@ function requireKey(res) {
   return true;
 }
 
+// Health check route: verifies the serverless function is running and env is set
+app.get(['/api', '/api/health', '/health'], (_req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'voice-agent',
+    hasOpenAiKey: Boolean(process.env.OPENAI_API_KEY),
+  });
+});
+
 // LLM proxy: streams the response (SSE) straight to the browser.
-app.post('/api/llm', async (req, res) => {
+app.post(['/api/llm', '/llm'], async (req, res) => {
   if (!requireKey(res)) return;
 
   const userText = typeof req.body.userText === 'string' ? req.body.userText.slice(0, 2000) : '';
@@ -89,7 +98,7 @@ ${userText}`;
 });
 
 // TTS proxy: streams the mp3 straight to the browser.
-app.post('/api/tts', async (req, res) => {
+app.post(['/api/tts', '/tts'], async (req, res) => {
   if (!requireKey(res)) return;
 
   const text = typeof req.body.text === 'string' ? req.body.text.slice(0, 1000) : '';
