@@ -23,6 +23,12 @@ try {
 
 const app = express();
 app.use(express.json({ limit: '100kb' }));
+// Defensive: if a request arrives without the JSON body parser firing
+// (wrong Content-Type), treat it as an empty body instead of undefined → 500.
+app.use((req, _res, next) => {
+  if (req.body === undefined) req.body = {};
+  next();
+});
 
 const LLM_MODEL = 'gpt-5.6-luna';
 const TTS_MODEL = 'gpt-4o-mini-tts';
