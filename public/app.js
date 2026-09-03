@@ -16,14 +16,19 @@ const state = {
   playedUpTo: -1,                // highest seq fully played back ("heard frontier")
   responseFullyGenerated: false, // LLM stream done → drainQueue may skip gaps
   lastLoudAt: 0,                 // last mic-loud frame timestamp
+  pendingDeferred: '',           // interrupted point the agent still owes the user
 };
 
 const BARGE_IN = {
-  rmsThreshold: 0.1,      // mic level considered "loud"
+  rmsThreshold: 0.04,     // mic level considered "loud". User speech reads
+                          // 0.10-0.15, the agent's own TTS ~0.006 — 0.04 keeps
+                          // soft/normal-pace speech detected without the agent
+                          // barge-in on itself.
   consecutiveFrames: 3,   // ~50ms of loudness = a real sound → pause
   interruptAfterMs: 2500, // continuous speech past this = real interruption
   gapToleranceMs: 600,    // word gaps don't reset the burst clock
-  silentResumeMs: 2000,   // untranscribed noise → resume after this silence
+  silentResumeMs: 3000,   // while paused: hold and listen until the user has
+                          // been quiet this long (no voice = truly done)
   resumeQuietMs: 400,     // never resume until the mic has been quiet this long
 };
 
@@ -89,13 +94,13 @@ function isAcknowledgment(text = '') {
 }
 
 // ---------------- LLM (streaming through the serverless proxy) ----------------
-async function* llmStreaming(userText = '', interruptedContext = '') {
+async function* llmStreaming(userText = '', interruptedContext = '', mode = 'answer') {
   let response;
   try {
     response = await fetch('/api/llm', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userText, interruptedContext }),
+      body: JSON.stringify({ userText, interruptedContext, mode }),
     });
   } catch (err) {
     addEvent('⚠️ Could not reach the LLM');
@@ -117,7 +122,7 @@ async function* llmStreaming(userText = '', interruptedContext = '') {
     let rest = text;
 
     while (true) {
-      const end = rest.search(/[.?]/);
+      const end = rest.search(/[.?!]/);
       if (end === -1) break;
       const sentence = rest.slice(0, end + 1).trim();
       rest = rest.slice(end + 1);
@@ -177,24 +182,39 @@ async function speak(text = '', seq = 0) {
   // has actually heard (see playedUpTo / onresult).
   state.sentenceTexts[seq] = text;
 
+  // Wait for a free TTS slot (concurrency limiter).
+  while (activeTtsRequests >= MAX_CONCURRENT_TTS) {
+    if (session !== state.playbackSession) return; // interrupted while waiting
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  if (session !== state.playbackSession) return;
+  activeTtsRequests++;
+
   let response = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      response = await fetch('/api/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
-      });
-    } catch (err) {
-      console.warn('🔇 TTS request failed for seq', seq, err);
-      return;
+  try {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        response = await fetch('/api/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text }),
+        });
+      } catch (err) {
+        console.warn('🔇 TTS request failed for seq', seq, err);
+        return;
+      }
+      if (response.ok) break;
+      if (response.status === 429) {
+        // Exponential backoff: 1s, 2s, 4s — then give up.
+        const backoff = 1000 * Math.pow(2, attempt);
+        console.log(`🔇 TTS 429 on seq ${seq}, backing off ${backoff}ms (attempt ${attempt + 1})`);
+        await new Promise((r) => setTimeout(r, backoff));
+        continue;
+      }
+      break; // non-429 error — don't retry
     }
-    if (response.ok) break;
-    if (response.status === 429 && attempt === 0) {
-      await new Promise((r) => setTimeout(r, 800)); // one gentle retry on rate limit
-      continue;
-    }
-    break;
+  } finally {
+    activeTtsRequests--;
   }
 
   if (!response || !response.ok) {
@@ -223,6 +243,12 @@ async function drainQueue(session) {
 
   try {
     while (session === state.playbackSession) {
+      // Paused on a user sound → freeze the queue. A later speak() re-enters
+      // drainQueue, but resumeForAcknowledgment re-kicks it once unpaused.
+      // Without this, a clip synthesized during a pause would start playing
+      // over the user's question.
+      if (state.tentativePause) break;
+
       if (Object.prototype.hasOwnProperty.call(state.pendingClips, state.nextToPlay)) {
         const seq = state.nextToPlay;
         const audioBlob = state.pendingClips[seq];
@@ -299,9 +325,17 @@ function interruptPlayback() {
 }
 
 function pauseForBargeIn() {
-  if (state.tentativePause || !state.currentAudioObj) return;
+  // Pause whenever the agent has ANY active or pending audio — not only while a
+  // clip element is mid-playback. Responses are sequences of sentence clips with
+  // gaps between them; an interruption landing in a gap previously caused NO
+  // pause, so the echo guard then ate the user's real question. This was the
+  // main source of flaky interrupt behavior.
+  if (state.tentativePause || !isAgentSpeaking()) return;
   state.tentativePause = true;
-  state.currentAudioObj.audio.pause();
+  lastBargeInAt = Date.now(); // see echo guard in onresult
+  if (state.currentAudioObj) {
+    state.currentAudioObj.audio.pause();
+  }
   addEvent('⏸ Paused — listening to you…');
   setStatus('Paused — listening…');
 }
@@ -317,7 +351,12 @@ function resumeForAcknowledgment() {
   addEvent('▶ Resuming');
   setStatus('Agent speaking…');
   if (state.currentAudioObj) {
+    // Paused mid-clip → unpause the element; the drain loop's await resumes it.
     state.currentAudioObj.audio.play().catch(() => {});
+  } else {
+    // Paused during a clip gap (no element exists) → re-kick the queue so the
+    // next already-synthesized clip plays.
+    drainQueue(state.playbackSession);
   }
 }
 
@@ -462,10 +501,28 @@ async function startBargeInMonitor() {
 // ---------------- speech recognition + turn handling ----------------
 let recognition = null;
 let running = false;
+// Tracks the last time recognition produced a result or restarted — used by the
+// watchdog to detect a recognizer that has silently died.
+let lastRecognitionActivity = Date.now();
+// Watchdog interval handle — cleared in stopAgent().
+let recognitionWatchdog = null;
+// Timestamp of the most recent barge-in pause. After a barge-in, the recognizer
+// may take a moment to finalize the transcript — any result that arrives within
+// WINDOW ms is the user's speech, NOT the agent's echo (see echo guard below).
+let lastBargeInAt = 0;
+const BARGE_IN_ECHO_GRACE_MS = 10000;
+// Serializes recognition restarts between the watchdog and the onend handler so
+// they don't both call start() → InvalidStateError.
+let recognitionRestartPending = false;
+// TTS concurrency limiter — OpenAI audio/speech has tight rate limits. Without
+// this, every sentence fires a request simultaneously and most get 429'd.
+let activeTtsRequests = 0;
+const MAX_CONCURRENT_TTS = 2;
 
 async function startAgent() {
   if (running) return;
   running = true;
+  lastBargeInAt = 0; // fresh session — no prior barge-in
   micBtn.classList.add('listening');
   setStatus('Listening… tap the mic to stop');
   addEvent('🎤 Session started');
@@ -494,7 +551,14 @@ async function startAgent() {
   recognition.interimResults = false;
   recognition.maxAlternatives = 1;
 
-  recognition.onresult = async function (event) {
+  // onresult is kept SYNCHRONOUS on purpose: the full LLM/TTS round-trip can
+  // take 10-20s, and Chrome may not fire the next onresult until the current
+  // handler returns. We extract the transcript, run the echo guard, then hand
+  // off to handleTurn() without awaiting — so the handler returns immediately
+  // and the recognizer stays responsive to the next thing the user says.
+  recognition.onresult = function (event) {
+    lastRecognitionActivity = Date.now();
+
     // Only take the NEW results (from resultIndex) — stale fragments otherwise.
     let transcript = '';
     for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -512,12 +576,27 @@ async function startAgent() {
     // e.g. "Nia followed the melody" came back as "follow the memory". A real
     // user turn ALWAYS trips the barge-in pause first; a transcript that arrives
     // while the agent is talking and no pause ever happened is echo.
-    if (isAgentSpeaking() && !state.tentativePause) {
+    //
+    // BUG FIX: after a barge-in, there's a race between the silence-resume timer
+    // (which clears tentativePause) and onresult firing with the user's transcript.
+    // If onresult fires after the resume, the naive guard above would wrongly treat
+    // the user's speech as echo. To prevent this, we skip the guard entirely for a
+    // grace window after any barge-in pause — the recognizer is finalizing the
+    // user's speech, not transcribing the agent's TTS.
+    const recentlyBargedIn = Date.now() - lastBargeInAt < BARGE_IN_ECHO_GRACE_MS;
+    if (isAgentSpeaking() && !state.tentativePause && !recentlyBargedIn) {
       console.log('🔇 Ignoring likely echo of agent speech:', transcript);
       addEvent('🔇 (ignored my own voice)');
       return;
     }
 
+    // Offload the async work (don't await — see note above).
+    handleTurn(transcript);
+  };
+
+  // Async part of turn handling — separated from onresult so the recognizer
+  // event handler returns immediately and stays responsive.
+  async function handleTurn(transcript) {
     addMessage('user', transcript);
 
     // Acknowledgment → continue the agent; real question → stop + answer.
@@ -545,59 +624,155 @@ async function startAgent() {
     for (let i = 0; i <= playedUpTo; i++) {
       if (oldSentences[i]) heard.push(oldSentences[i]);
     }
-    const interruptedContext = heard.join(' ');
+    // What the agent still owes the user: an earlier deferral that was never
+    // continued (survives multiple rapid interrupts), or what was just heard.
+    const interruptedContext = state.pendingDeferred || heard.join(' ');
+    state.pendingDeferred = interruptedContext; // cleared once it's been continued
     state.sentenceTexts = {}; // fresh for the new response
     if (interruptedContext) {
       addEvent('📝 Will finish my earlier point after this');
+      console.log('📝 Deferred context:', interruptedContext.slice(0, 160));
     }
 
     let seq = 0;
     const session = state.playbackSession;
     state.responseFullyGenerated = false;
-    for await (const chunk of llmStreaming(transcript, interruptedContext)) {
-      // A newer turn took over → stop consuming this abandoned stream.
-      if (session !== state.playbackSession) break;
-      addMessage('agent', chunk.delta);
-      speak(chunk.delta, seq++);
-    }
-    // Generation finished. The drain loop may have exited while the last clips
-    // were still synthesizing — restart it so the tail always plays.
-    if (session === state.playbackSession) {
-      state.responseFullyGenerated = true;
-      drainQueue(session);
+    try {
+      // Phase 1 — answer the interruption ONLY (server prompt forbids
+      // resuming the earlier point here).
+      for await (const chunk of llmStreaming(transcript, interruptedContext)) {
+        // A newer turn took over → stop consuming this abandoned stream.
+        if (session !== state.playbackSession) break;
+        addMessage('agent', chunk.delta);
+        speak(chunk.delta, seq++);
+      }
+      // Phase 2 — DETERMINISTICALLY continue the deferred point, appended to
+      // the same playback queue. This is the guarantee the deferral works:
+      // it no longer depends on the model doing both parts in one response.
+      if (interruptedContext && session === state.playbackSession) {
+        addEvent('📝 Continuing my earlier point');
+        for await (const chunk of llmStreaming(
+          '(Continue exactly where you left off before my interruption.)',
+          interruptedContext,
+          'continue'
+        )) {
+          if (session !== state.playbackSession) break;
+          addMessage('agent', chunk.delta);
+          speak(chunk.delta, seq++);
+        }
+      }
+      // Generation finished. The drain loop may have exited while the last clips
+      // were still synthesizing — restart it so the tail always plays.
+      if (session === state.playbackSession) {
+        state.responseFullyGenerated = true;
+        drainQueue(session);
+        state.pendingDeferred = ''; // deferral delivered
+      }
+    } catch (err) {
+      // A dead stream (network drop, malformed SSE) must never leave the agent
+      // stuck in "Answering…" with no recovery path.
+      console.error('Turn handling error:', err);
+      if (session === state.playbackSession) {
+        addEvent('⚠️ Something went wrong — try again');
+        setStatus('Ready — tap the mic and talk');
+        state.responseFullyGenerated = true;
+        drainQueue(session);
+      }
     }
     setStatus('Agent speaking…');
-  };
+  }
 
   // Chrome ends the recognition session after long silence — restart it.
+  // This is the critical keepalive: if start() throws (e.g. the previous
+  // session hasn't fully torn down after rapid restart cycles), retry after a
+  // short delay instead of letting recognition die silently.
+  //
+  // The watchdog below may also try to restart. To avoid both paths calling
+  // start() → InvalidStateError, whichever path is pending sets
+  // recognitionRestartPending and the other path skips.
   recognition.onend = function () {
+    lastRecognitionActivity = Date.now();
     if (!running) return;
+    if (recognitionRestartPending) return; // watchdog owns the restart
     try {
       recognition.start();
+      console.log('🔄 Recognition restarted');
     } catch {
-      /* already starting */
+      // start() can throw if the previous session hasn't fully torn down.
+      // Retry after a short delay instead of giving up.
+      console.log('🔄 Recognition restart delayed, retrying…');
+      recognitionRestartPending = true;
+      setTimeout(() => {
+        recognitionRestartPending = false;
+        if (!running) return;
+        try {
+          recognition.start();
+          lastRecognitionActivity = Date.now();
+          console.log('🔄 Recognition restarted on retry');
+        } catch (err) {
+          console.error('❌ Failed to restart recognition:', err);
+          addEvent('⚠️ Mic stopped listening — tap the mic to restart');
+          stopAgent();
+        }
+      }, 500);
     }
   };
 
   recognition.onerror = function (e) {
+    lastRecognitionActivity = Date.now();
     if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
       addEvent('⚠️ Speech recognition blocked — allow mic access');
       stopAgent();
     }
+    // Other errors (e.g. 'no-speech', 'aborted') are transient — onend will
+    // fire next and trigger a restart, so we don't need to handle them here.
   };
 
   recognition.start();
+  lastRecognitionActivity = Date.now();
 
-  // Greet immediately so the user hears the pipeline working (and can barge in).
-  const greeting = "Hi! I'm listening — ask me anything, and feel free to interrupt me.";
-  addMessage('agent', greeting);
-  setStatus('Agent speaking…');
-  speak(greeting, 0);
+  // Watchdog: if recognition has been silent for a while (no onresult, no onend
+  // restart) and the agent isn't speaking, the recognizer may have died without
+  // firing onerror. Force a restart.
+  //
+  // Uses recognitionRestartPending to avoid racing with the onend handler's
+  // own restart — only one path may own the restart at a time.
+  recognitionWatchdog = setInterval(() => {
+    if (!running) return;
+    if (recognitionRestartPending) return; // onend owns the restart
+    const idle = Date.now() - lastRecognitionActivity;
+    // Only act when the agent is not speaking — during a long response it's
+    // normal for the recognizer to be quiet.
+    if (idle > 25000 && !isAgentSpeaking()) {
+      console.log(`🔄 Watchdog: recognition idle for ${(idle / 1000).toFixed(0)}s, restarting`);
+      recognitionRestartPending = true;
+      try {
+        recognition.stop();
+      } catch {
+        /* not running */
+      }
+      setTimeout(() => {
+        recognitionRestartPending = false;
+        if (!running) return;
+        try {
+          recognition.start();
+          lastRecognitionActivity = Date.now();
+        } catch (err) {
+          console.error('Watchdog restart failed:', err);
+          // onend will fire from the failed start and handle the retry.
+        }
+      }, 300);
+    }
+  }, 10000);
 }
 
 function stopAgent() {
   running = false;
   monitorActive = false;
+  if (recognitionWatchdog) {
+    clearInterval(recognitionWatchdog);
+    recognitionWatchdog = null;
+  }
   interruptPlayback();
   if (recognition) {
     try {
