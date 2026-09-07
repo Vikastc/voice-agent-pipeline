@@ -10,6 +10,23 @@
   <body>
     <main class="app">
       <header>
+        <div id="authBar" class="auth-bar" style="display: none;">
+          <div class="user-badge">
+            <span class="user-icon">👤</span>
+            <span id="userName">User</span>
+          </div>
+          <div class="quota-container">
+            <div class="quota-pill">
+              <span class="bolt">⚡</span>
+              <span id="tokensRemaining">20,000</span> / 20,000 tokens left
+            </div>
+            <div class="quota-bar">
+              <div id="quotaProgress" class="quota-progress" style="width: 100%;"></div>
+            </div>
+          </div>
+          <button id="logoutBtn" class="logout-btn" type="button" title="Sign out / Switch key">Sign Out</button>
+        </div>
+
         <h1>🎙️ Voice Agent</h1>
         <p class="subtitle">Click the mic, then just talk. Interrupt me anytime — I'll listen, answer, and finish my point.</p>
       </header>
@@ -21,11 +38,48 @@
 
       <div id="messages" class="messages" aria-live="polite"></div>
 
+      <form id="textForm" class="text-form">
+        <input type="text" id="textInput" placeholder="Type a message or tap the mic to speak…" autocomplete="off" />
+        <button type="submit" id="sendBtn">Send</button>
+      </form>
+
       <p class="hint">
         Try: interrupt me with a question while I'm talking, or just say “okay” —
         I'll pause, listen, and pick up where I left off.
       </p>
     </main>
+
+    <!-- Authentication Modal -->
+    <div id="authModal" class="modal-backdrop" style="display: none;">
+      <div class="modal-card">
+        <div class="modal-icon">🔐</div>
+        <h2>Access Required</h2>
+        <p class="modal-desc">Enter your Access Key to start your voice agent session (20,000 tokens allowance per user).</p>
+        <form id="loginForm">
+          <div class="input-group">
+            <label for="accessKeyInput">Access Key</label>
+            <input type="text" id="accessKeyInput" placeholder="Enter your access key…" autocomplete="off" required />
+          </div>
+          <div id="loginError" class="login-error" style="display: none;"></div>
+          <button type="submit" id="loginSubmitBtn" class="btn-primary">Start Session</button>
+        </form>
+        <div class="modal-footer">
+          <span>Need an access key? Contact the administrator.</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Quota Exhausted Modal -->
+    <div id="quotaModal" class="modal-backdrop" style="display: none;">
+      <div class="modal-card quota-card">
+        <div class="modal-icon">⛔</div>
+        <h2>Quota Exhausted</h2>
+        <p class="modal-desc">You have used all 20,000 tokens for this access key.</p>
+        <p class="quota-subtext">Contact your administrator or switch to another access key to continue.</p>
+        <button id="switchKeyBtn" class="btn-primary" type="button">Switch Access Key</button>
+      </div>
+    </div>
+
     <script src="app.js"></script>
   </body>
 </html>

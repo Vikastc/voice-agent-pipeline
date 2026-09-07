@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node bargeIn.test.js"
+    "test": "node bargeIn.test.js && node auth.test.js"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

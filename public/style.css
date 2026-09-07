@@ -12,10 +12,95 @@ body {
 .app {
   max-width: 640px;
   margin: 0 auto;
-  padding: 32px 16px 64px;
+  padding: 24px 16px 64px;
   display: flex;
   flex-direction: column;
   align-items: center;
+}
+
+header {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+/* ---------------- Auth Bar & Quota Meter ---------------- */
+.auth-bar {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  background: #161a24;
+  border: 1px solid #242b3b;
+  border-radius: 12px;
+  margin-bottom: 20px;
+}
+
+.user-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #c7cbd6;
+}
+
+.quota-container {
+  flex: 1;
+  max-width: 280px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.quota-pill {
+  font-size: 12px;
+  font-weight: 600;
+  color: #9aa3b2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+.bolt {
+  color: #f59e0b;
+}
+
+.quota-bar {
+  width: 100%;
+  height: 6px;
+  background: #242b3b;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.quota-progress {
+  height: 100%;
+  background: #10b981;
+  border-radius: 3px;
+  transition: width 0.3s ease, background 0.3s ease;
+}
+
+.logout-btn {
+  background: transparent;
+  border: 1px solid #2c3242;
+  color: #9aa3b2;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.logout-btn:hover {
+  background: #242b3b;
+  color: #e8eaf0;
+  border-color: #3b4254;
 }
 
 h1 {
@@ -24,7 +109,7 @@ h1 {
 }
 
 .subtitle {
-  margin: 0 0 24px;
+  margin: 0 0 16px;
   color: #9aa3b2;
   font-size: 14px;
   text-align: center;
@@ -61,6 +146,7 @@ h1 {
   color: #9aa3b2;
   font-size: 14px;
   min-height: 20px;
+  text-align: center;
 }
 
 .messages {
@@ -68,6 +154,7 @@ h1 {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  margin-bottom: 16px;
 }
 
 .msg {
@@ -100,9 +187,180 @@ h1 {
   font-style: italic;
 }
 
+/* ---------------- Text Form Fallback ---------------- */
+.text-form {
+  width: 100%;
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.text-form input {
+  flex: 1;
+  padding: 12px 16px;
+  border-radius: 10px;
+  border: 1px solid #2c3242;
+  background: #161a24;
+  color: #e8eaf0;
+  font-size: 15px;
+  outline: none;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.text-form input:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+}
+
+.text-form button {
+  padding: 12px 22px;
+  border-radius: 10px;
+  border: none;
+  background: #2451b3;
+  color: #ffffff;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+}
+
+.text-form button:hover {
+  background: #1d4299;
+}
+
+.text-form button:active {
+  transform: scale(0.98);
+}
+
 .hint {
   margin-top: 24px;
   color: #6b7484;
   font-size: 13px;
   text-align: center;
+}
+
+/* ---------------- Modals ---------------- */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 10, 15, 0.85);
+  backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 999;
+  padding: 16px;
+}
+
+.modal-card {
+  width: 100%;
+  max-width: 420px;
+  background: #161a24;
+  border: 1px solid #2a3142;
+  border-radius: 18px;
+  padding: 32px 26px;
+  text-align: center;
+  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.6);
+  animation: modalIn 0.2s ease-out;
+}
+
+@keyframes modalIn {
+  from { opacity: 0; transform: scale(0.95) translateY(10px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.modal-icon {
+  font-size: 40px;
+  margin-bottom: 12px;
+}
+
+.modal-card h2 {
+  margin: 0 0 8px;
+  font-size: 22px;
+  color: #ffffff;
+}
+
+.modal-desc {
+  margin: 0 0 24px;
+  font-size: 14px;
+  color: #9aa3b2;
+  line-height: 1.45;
+}
+
+.input-group {
+  text-align: left;
+  margin-bottom: 16px;
+}
+
+.input-group label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: #9aa3b2;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+
+.input-group input {
+  width: 100%;
+  padding: 12px 14px;
+  background: #0d0f14;
+  border: 1px solid #2c3242;
+  border-radius: 8px;
+  color: #ffffff;
+  font-size: 15px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.input-group input:focus {
+  border-color: #3b82f6;
+}
+
+.btn-primary {
+  width: 100%;
+  padding: 12px;
+  border-radius: 8px;
+  border: none;
+  background: #2563eb;
+  color: #ffffff;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn-primary:hover {
+  background: #1d4ed8;
+}
+
+.login-error {
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  margin-bottom: 16px;
+  text-align: left;
+}
+
+.modal-footer {
+  margin-top: 20px;
+  font-size: 12px;
+  color: #6b7484;
+}
+
+.modal-footer code {
+  background: #242b3b;
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: #9aa3b2;
+}
+
+.quota-subtext {
+  font-size: 13px;
+  color: #6b7484;
+  margin-bottom: 20px;
 }

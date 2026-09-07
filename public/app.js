@@ -2,7 +2,7 @@
 // Voice Agent — frontend
 // Same state machine as the prototype (barge-in, acknowledgments,
 // echo guard, heard-based deferral). The OpenAI key stays server-side:
-// LLM + TTS go through the /api/* serverless proxies.
+// LLM + TTS go through the /api/* serverless proxies with token quota tracking.
 // ============================================================
 
 const state = {
@@ -20,23 +20,42 @@ const state = {
 };
 
 const BARGE_IN = {
-  rmsThreshold: 0.04,     // mic level considered "loud". User speech reads
-                          // 0.10-0.15, the agent's own TTS ~0.006 — 0.04 keeps
-                          // soft/normal-pace speech detected without the agent
-                          // barge-in on itself.
+  rmsThreshold: 0.04,     // mic level considered "loud"
   consecutiveFrames: 3,   // ~50ms of loudness = a real sound → pause
   interruptAfterMs: 2500, // continuous speech past this = real interruption
   gapToleranceMs: 600,    // word gaps don't reset the burst clock
-  silentResumeMs: 3000,   // while paused: hold and listen until the user has
-                          // been quiet this long (no voice = truly done)
-  resumeQuietMs: 400,     // never resume until the mic has been quiet this long
+  silentResumeMs: 3000,   // while paused: hold and listen until user is quiet
+  resumeQuietMs: 400,     // never resume until mic has been quiet this long
 };
 
-// ---------------- UI helpers ----------------
+// ---------------- UI helpers & Auth State ----------------
 const isBrowser = typeof window !== 'undefined';
+let authToken = isBrowser ? localStorage.getItem('va_token') : null;
+let currentUserId = null;
+let tokensUsed = 0;
+let maxTokens = 20000;
+
 const micBtn = isBrowser ? document.getElementById('micBtn') : null;
 const statusEl = isBrowser ? document.getElementById('status') : null;
 const messagesEl = isBrowser ? document.getElementById('messages') : null;
+
+// Auth & Quota Elements
+const authBar = isBrowser ? document.getElementById('authBar') : null;
+const userNameEl = isBrowser ? document.getElementById('userName') : null;
+const tokensRemainingEl = isBrowser ? document.getElementById('tokensRemaining') : null;
+const quotaProgressEl = isBrowser ? document.getElementById('quotaProgress') : null;
+const logoutBtn = isBrowser ? document.getElementById('logoutBtn') : null;
+
+const authModal = isBrowser ? document.getElementById('authModal') : null;
+const loginForm = isBrowser ? document.getElementById('loginForm') : null;
+const accessKeyInput = isBrowser ? document.getElementById('accessKeyInput') : null;
+const loginError = isBrowser ? document.getElementById('loginError') : null;
+
+const quotaModal = isBrowser ? document.getElementById('quotaModal') : null;
+const switchKeyBtn = isBrowser ? document.getElementById('switchKeyBtn') : null;
+
+const textForm = isBrowser ? document.getElementById('textForm') : null;
+const textInput = isBrowser ? document.getElementById('textInput') : null;
 
 function setStatus(text) {
   if (statusEl) statusEl.textContent = text;
@@ -58,6 +77,83 @@ function addEvent(text) {
   div.textContent = text;
   messagesEl.appendChild(div);
   messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+// ---------------- Quota & Modal Management ----------------
+function updateQuotaUI(used, max) {
+  tokensUsed = typeof used === 'number' ? used : tokensUsed;
+  maxTokens = typeof max === 'number' ? max : maxTokens;
+
+  const remaining = Math.max(0, maxTokens - tokensUsed);
+  if (tokensRemainingEl) {
+    tokensRemainingEl.textContent = remaining.toLocaleString();
+  }
+
+  const pct = Math.max(0, Math.min(100, (remaining / maxTokens) * 100));
+  if (quotaProgressEl) {
+    quotaProgressEl.style.width = `${pct}%`;
+    if (pct <= 10) {
+      quotaProgressEl.style.backgroundColor = '#ef4444'; // Red
+    } else if (pct <= 25) {
+      quotaProgressEl.style.backgroundColor = '#f59e0b'; // Amber
+    } else {
+      quotaProgressEl.style.backgroundColor = '#10b981'; // Green
+    }
+  }
+
+  if (remaining === 0) {
+    showQuotaModal();
+  }
+}
+
+function showAuthModal() {
+  if (authModal) {
+    authModal.style.display = 'flex';
+    if (accessKeyInput) accessKeyInput.focus();
+  }
+}
+
+function hideAuthModal() {
+  if (authModal) authModal.style.display = 'none';
+  if (loginError) loginError.style.display = 'none';
+}
+
+function showQuotaModal() {
+  stopAgent();
+  if (quotaModal) quotaModal.style.display = 'flex';
+  setStatus('Token quota exhausted (20,000 / 20,000)');
+}
+
+function hideQuotaModal() {
+  if (quotaModal) quotaModal.style.display = 'none';
+}
+
+async function verifyAuthSession() {
+  if (!authToken) {
+    showAuthModal();
+    return false;
+  }
+  try {
+    const res = await fetch('/api/auth/me', {
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    if (!res.ok) {
+      localStorage.removeItem('va_token');
+      authToken = null;
+      showAuthModal();
+      return false;
+    }
+    const data = await res.json();
+    currentUserId = data.user;
+    if (userNameEl) userNameEl.textContent = currentUserId;
+    if (authBar) authBar.style.display = 'flex';
+    updateQuotaUI(data.tokensUsed, data.maxTokens);
+    hideAuthModal();
+    return true;
+  } catch (err) {
+    console.warn('Auth check warning:', err);
+    return false;
+  }
 }
 
 // ---------------- acknowledgments (back-channels) ----------------
@@ -99,13 +195,29 @@ async function* llmStreaming(userText = '', interruptedContext = '', mode = 'ans
   try {
     response = await fetch('/api/llm', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      },
       body: JSON.stringify({ userText, interruptedContext, mode }),
     });
   } catch (err) {
     addEvent('⚠️ Could not reach the LLM');
     return;
   }
+
+  if (response.status === 401) {
+    addEvent('⚠️ Session expired — please sign in with an access key');
+    showAuthModal();
+    return;
+  }
+
+  if (response.status === 403) {
+    addEvent('⛔ Token quota reached (20,000 / 20,000 used)');
+    showQuotaModal();
+    return;
+  }
+
   if (!response.ok || !response.body) {
     addEvent(`⚠️ LLM error (${response.status})`);
     return;
@@ -141,6 +253,26 @@ async function* llmStreaming(userText = '', interruptedContext = '', mode = 'ans
     buffer = events.pop() ?? '';
 
     for (const event of events) {
+      // Check for token usage update event
+      if (event.includes('event: token_usage')) {
+        const dataLine = event
+          .split('\n')
+          .find((line) => line.startsWith('data: '));
+        if (dataLine) {
+          try {
+            const usageInfo = JSON.parse(dataLine.slice(6));
+            if (usageInfo.tokensUsed !== undefined) {
+              updateQuotaUI(usageInfo.tokensUsed, usageInfo.maxTokens);
+              if (usageInfo.token) {
+                authToken = usageInfo.token;
+                localStorage.setItem('va_token', usageInfo.token);
+              }
+            }
+          } catch {}
+        }
+        continue;
+      }
+
       const payload = event
         .split('\n')
         .filter((line) => line.startsWith('data: '))
@@ -149,23 +281,25 @@ async function* llmStreaming(userText = '', interruptedContext = '', mode = 'ans
 
       if (!payload || payload === '[DONE]') continue;
 
-      const parsed = JSON.parse(payload);
+      try {
+        const parsed = JSON.parse(payload);
 
-      if (parsed.type === 'response.output_text.delta') {
-        textContent += parsed.delta;
-        sentenceBuffer += parsed.delta;
+        if (parsed.type === 'response.output_text.delta') {
+          textContent += parsed.delta;
+          sentenceBuffer += parsed.delta;
 
-        const { sentences, rest } = takeSentences(sentenceBuffer);
-        sentenceBuffer = rest;
+          const { sentences, rest } = takeSentences(sentenceBuffer);
+          sentenceBuffer = rest;
 
-        for (const sentence of sentences) {
-          yield { textContent, isFinal: false, delta: sentence };
+          for (const sentence of sentences) {
+            yield { textContent, isFinal: false, delta: sentence };
+          }
         }
-      }
 
-      if (parsed.type === 'response.output_text.done') {
-        textContent = parsed.text ?? textContent;
-      }
+        if (parsed.type === 'response.output_text.done') {
+          textContent = parsed.text ?? textContent;
+        }
+      } catch {}
     }
   }
 
@@ -176,15 +310,16 @@ async function* llmStreaming(userText = '', interruptedContext = '', mode = 'ans
 }
 
 // ---------------- TTS (through the serverless proxy) ----------------
+let activeTtsRequests = 0;
+const MAX_CONCURRENT_TTS = 2;
+
 async function speak(text = '', seq = 0) {
   const session = state.playbackSession;
-  // Record the sentence text so an interruption can reconstruct what the user
-  // has actually heard (see playedUpTo / onresult).
   state.sentenceTexts[seq] = text;
 
   // Wait for a free TTS slot (concurrency limiter).
   while (activeTtsRequests >= MAX_CONCURRENT_TTS) {
-    if (session !== state.playbackSession) return; // interrupted while waiting
+    if (session !== state.playbackSession) return;
     await new Promise((r) => setTimeout(r, 200));
   }
   if (session !== state.playbackSession) return;
@@ -196,7 +331,10 @@ async function speak(text = '', seq = 0) {
       try {
         response = await fetch('/api/tts', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+          },
           body: JSON.stringify({ text }),
         });
       } catch (err) {
@@ -204,51 +342,62 @@ async function speak(text = '', seq = 0) {
         return;
       }
       if (response.ok) break;
+      if (response.status === 401) {
+        showAuthModal();
+        return;
+      }
+      if (response.status === 403) {
+        showQuotaModal();
+        return;
+      }
       if (response.status === 429) {
-        // Exponential backoff: 1s, 2s, 4s — then give up.
         const backoff = 1000 * Math.pow(2, attempt);
         console.log(`🔇 TTS 429 on seq ${seq}, backing off ${backoff}ms (attempt ${attempt + 1})`);
         await new Promise((r) => setTimeout(r, backoff));
         continue;
       }
-      break; // non-429 error — don't retry
+      break;
     }
+
+    if (!response || !response.ok) {
+      console.warn('🔇 TTS rejected for seq', seq, response && response.status);
+      return;
+    }
+
+    // Read updated tokens from headers if present
+    const updatedTokens = response.headers.get('X-Tokens-Used');
+    const updatedToken = response.headers.get('X-New-Token');
+    if (updatedTokens !== null) {
+      updateQuotaUI(Number(updatedTokens), maxTokens);
+    }
+    if (updatedToken) {
+      authToken = updatedToken;
+      localStorage.setItem('va_token', updatedToken);
+    }
+
+    let audioBlob;
+    try {
+      audioBlob = await response.blob();
+    } catch (err) {
+      console.warn('🔇 TTS blob failed for seq', seq, err);
+      return;
+    }
+
+    if (session !== state.playbackSession) return;
+
+    state.pendingClips[seq] = audioBlob;
+    drainQueue(session);
   } finally {
     activeTtsRequests--;
   }
-
-  if (!response || !response.ok) {
-    console.warn('🔇 TTS rejected for seq', seq, response && response.status);
-    return;
-  }
-
-  let audioBlob;
-  try {
-    audioBlob = await response.blob();
-  } catch (err) {
-    console.warn('🔇 TTS blob failed for seq', seq, err);
-    return;
-  }
-
-  // If the user interrupted while we were synthesizing this sentence, discard it.
-  if (session !== state.playbackSession) return;
-
-  state.pendingClips[seq] = audioBlob;
-  drainQueue(session);
 }
 
 async function drainQueue(session) {
-  if (state.isPlaying) return; // another drain loop is already running
+  if (state.isPlaying) return;
   state.isPlaying = true;
 
   try {
     while (session === state.playbackSession) {
-      // Paused on a user sound → freeze the queue. A later speak() re-enters
-      // drainQueue, but resumeForAcknowledgment re-kicks it once unpaused.
-      // Without this, a clip synthesized during a pause would start playing
-      // over the user's question.
-      if (state.tentativePause) break;
-
       if (Object.prototype.hasOwnProperty.call(state.pendingClips, state.nextToPlay)) {
         const seq = state.nextToPlay;
         const audioBlob = state.pendingClips[seq];
@@ -279,15 +428,11 @@ async function drainQueue(session) {
             };
             audio.play().catch(reject);
           });
-          // Fully played back to the user — this is the heard frontier.
           state.playedUpTo = seq;
         } catch (err) {
-          // One bad clip must not kill the whole queue.
           console.warn('🔇 Clip playback failed for seq', seq, err);
         }
       } else if (state.responseFullyGenerated) {
-        // Generation is finished, so a missing seq means its TTS failed.
-        // Skip ahead to whatever clips exist instead of stalling forever.
         const remaining = Object.keys(state.pendingClips)
           .map(Number)
           .sort((a, b) => a - b);
@@ -295,7 +440,6 @@ async function drainQueue(session) {
         console.log('⏭ Skipping failed clip seq', state.nextToPlay, '→', remaining[0]);
         state.nextToPlay = remaining[0];
       } else {
-        // Next clip is still synthesizing; a later speak() re-enters drainQueue.
         break;
       }
     }
@@ -319,30 +463,24 @@ function interruptPlayback() {
     resolve?.();
   }
 
-  // Drop all pending clips and reset the ordering back to the start.
   state.pendingClips = {};
   state.nextToPlay = 0;
 }
 
+let lastBargeInAt = 0;
+const BARGE_IN_ECHO_GRACE_MS = 10000;
+
 function pauseForBargeIn() {
-  // Pause whenever the agent has ANY active or pending audio — not only while a
-  // clip element is mid-playback. Responses are sequences of sentence clips with
-  // gaps between them; an interruption landing in a gap previously caused NO
-  // pause, so the echo guard then ate the user's real question. This was the
-  // main source of flaky interrupt behavior.
-  if (state.tentativePause || !isAgentSpeaking()) return;
+  if (state.tentativePause || !state.currentAudioObj) return;
   state.tentativePause = true;
-  lastBargeInAt = Date.now(); // see echo guard in onresult
-  if (state.currentAudioObj) {
-    state.currentAudioObj.audio.pause();
-  }
+  lastBargeInAt = Date.now();
+  state.currentAudioObj.audio.pause();
   addEvent('⏸ Paused — listening to you…');
   setStatus('Paused — listening…');
 }
 
 function resumeForAcknowledgment() {
   if (!state.tentativePause) return;
-  // HARD RULE: stay paused until the user has finished speaking.
   if (Date.now() - state.lastLoudAt < BARGE_IN.resumeQuietMs) {
     console.log('⏳ Holding pause — user is still speaking');
     return;
@@ -351,17 +489,11 @@ function resumeForAcknowledgment() {
   addEvent('▶ Resuming');
   setStatus('Agent speaking…');
   if (state.currentAudioObj) {
-    // Paused mid-clip → unpause the element; the drain loop's await resumes it.
     state.currentAudioObj.audio.play().catch(() => {});
-  } else {
-    // Paused during a clip gap (no element exists) → re-kick the queue so the
-    // next already-synthesized clip plays.
-    drainQueue(state.playbackSession);
   }
 }
 
 // Pure timing rules (unit-tested in bargeIn.test.js).
-// Returns 'none' | 'interrupt' | 'resume'.
 function bargeInTimingAction({ loud, paused, now, lastLoudAt, burstStart, cfg }) {
   if (loud) {
     const burstActive = burstStart > 0 && now - lastLoudAt <= cfg.gapToleranceMs;
@@ -418,20 +550,10 @@ async function startBargeInMonitor() {
 
   const samples = new Uint8Array(analyser.fftSize);
   let loudFrames = 0;
-  // When the current continuous speech burst began (0 = not speaking). Survives
-  // word gaps up to gapToleranceMs so real interruptions actually accumulate.
   let burstStart = 0;
 
-  // Quick mic sanity check so a silent/blocked mic is obvious in the console.
-  let diagCount = 0;
-  const diagTimer = setInterval(() => {
-    const r = getMicRms(analyser, samples);
-    console.log(`🎙 mic RMS: ${r.toFixed(3)}${r >= BARGE_IN.rmsThreshold ? ' (loud)' : ''}`);
-    if (++diagCount >= 5) clearInterval(diagTimer);
-  }, 500);
-
   function tick() {
-    if (!monitorActive) return; // agent stopped
+    if (!monitorActive) return;
 
     const now = Date.now();
     const rms = getMicRms(analyser, samples);
@@ -439,11 +561,9 @@ async function startBargeInMonitor() {
     const prevLoudAt = state.lastLoudAt;
 
     if (loudEnough) {
-      // Long gap since the last loud frame → this is a NEW burst of speech.
       if (!burstStart || now - prevLoudAt > BARGE_IN.gapToleranceMs) burstStart = now;
       state.lastLoudAt = now;
 
-      // First sound while the agent is speaking → pause it immediately.
       if (!state.tentativePause && isAgentSpeaking()) {
         loudFrames += 1;
         if (loudFrames >= BARGE_IN.consecutiveFrames) {
@@ -453,7 +573,6 @@ async function startBargeInMonitor() {
         }
       }
 
-      // Sustained speech (word gaps tolerated) → hard-stop and clear everything.
       if (
         bargeInTimingAction({
           loud: true,
@@ -471,11 +590,8 @@ async function startBargeInMonitor() {
       }
     } else {
       loudFrames = 0;
-      // Only a real gap (longer than a word pause) ends the burst.
       if (burstStart && now - prevLoudAt > BARGE_IN.gapToleranceMs) burstStart = 0;
 
-      // Paused on a sound recognition never transcribed (cough/noise) → resume
-      // once the user has truly been quiet for silentResumeMs.
       if (
         bargeInTimingAction({
           loud: false,
@@ -501,28 +617,107 @@ async function startBargeInMonitor() {
 // ---------------- speech recognition + turn handling ----------------
 let recognition = null;
 let running = false;
-// Tracks the last time recognition produced a result or restarted — used by the
-// watchdog to detect a recognizer that has silently died.
 let lastRecognitionActivity = Date.now();
-// Watchdog interval handle — cleared in stopAgent().
 let recognitionWatchdog = null;
-// Timestamp of the most recent barge-in pause. After a barge-in, the recognizer
-// may take a moment to finalize the transcript — any result that arrives within
-// WINDOW ms is the user's speech, NOT the agent's echo (see echo guard below).
-let lastBargeInAt = 0;
-const BARGE_IN_ECHO_GRACE_MS = 10000;
-// Serializes recognition restarts between the watchdog and the onend handler so
-// they don't both call start() → InvalidStateError.
 let recognitionRestartPending = false;
-// TTS concurrency limiter — OpenAI audio/speech has tight rate limits. Without
-// this, every sentence fires a request simultaneously and most get 429'd.
-let activeTtsRequests = 0;
-const MAX_CONCURRENT_TTS = 2;
+
+// Async part of turn handling
+async function handleTurn(transcript) {
+  if (!transcript || !transcript.trim()) return;
+  transcript = transcript.trim();
+
+  if (!authToken) {
+    showAuthModal();
+    return;
+  }
+  if (tokensUsed >= maxTokens) {
+    showQuotaModal();
+    return;
+  }
+
+  addMessage('user', transcript);
+
+  if (isAcknowledgment(transcript)) {
+    console.log('🙂 Acknowledgment — agent continues speaking');
+    addEvent('🙂 — continuing');
+    resumeForAcknowledgment();
+    return;
+  }
+
+  console.log('🗣 Answering:', transcript);
+  addEvent('🛑 Answering you…');
+  setStatus('Answering…');
+
+  const playedUpTo = state.playedUpTo;
+  const oldSentences = { ...state.sentenceTexts };
+
+  interruptPlayback();
+
+  const heard = [];
+  for (let i = 0; i <= playedUpTo; i++) {
+    if (oldSentences[i]) heard.push(oldSentences[i]);
+  }
+  const interruptedContext = state.pendingDeferred || heard.join(' ');
+  state.pendingDeferred = interruptedContext;
+  state.sentenceTexts = {};
+  if (interruptedContext) {
+    addEvent('📝 Will finish my earlier point after this');
+  }
+
+  let seq = 0;
+  const session = state.playbackSession;
+  state.responseFullyGenerated = false;
+
+  try {
+    for await (const chunk of llmStreaming(transcript, interruptedContext)) {
+      if (session !== state.playbackSession) break;
+      addMessage('agent', chunk.delta);
+      speak(chunk.delta, seq++);
+    }
+
+    if (interruptedContext && session === state.playbackSession) {
+      addEvent('📝 Continuing my earlier point');
+      for await (const chunk of llmStreaming(
+        '(Continue exactly where you left off before my interruption.)',
+        interruptedContext,
+        'continue'
+      )) {
+        if (session !== state.playbackSession) break;
+        addMessage('agent', chunk.delta);
+        speak(chunk.delta, seq++);
+      }
+    }
+
+    if (session === state.playbackSession) {
+      state.responseFullyGenerated = true;
+      drainQueue(session);
+      state.pendingDeferred = '';
+    }
+  } catch (err) {
+    console.error('Turn handling error:', err);
+    if (session === state.playbackSession) {
+      addEvent('⚠️ Something went wrong — try again');
+      setStatus('Ready — tap the mic and talk');
+      state.responseFullyGenerated = true;
+      drainQueue(session);
+    }
+  }
+  setStatus('Agent speaking…');
+}
 
 async function startAgent() {
   if (running) return;
+
+  if (!authToken) {
+    showAuthModal();
+    return;
+  }
+  if (tokensUsed >= maxTokens) {
+    showQuotaModal();
+    return;
+  }
+
   running = true;
-  lastBargeInAt = 0; // fresh session — no prior barge-in
   micBtn.classList.add('listening');
   setStatus('Listening… tap the mic to stop');
   addEvent('🎤 Session started');
@@ -539,10 +734,8 @@ async function startAgent() {
 
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SpeechRecognition) {
-    addEvent('⚠️ This browser does not support speech recognition (try Chrome)');
-    setStatus('Unsupported browser');
-    running = false;
-    micBtn.classList.remove('listening');
+    addEvent('⚠️ This browser does not support speech recognition (try Chrome or type below)');
+    setStatus('Unsupported browser — use text input');
     return;
   }
 
@@ -551,15 +744,8 @@ async function startAgent() {
   recognition.interimResults = false;
   recognition.maxAlternatives = 1;
 
-  // onresult is kept SYNCHRONOUS on purpose: the full LLM/TTS round-trip can
-  // take 10-20s, and Chrome may not fire the next onresult until the current
-  // handler returns. We extract the transcript, run the echo guard, then hand
-  // off to handleTurn() without awaiting — so the handler returns immediately
-  // and the recognizer stays responsive to the next thing the user says.
   recognition.onresult = function (event) {
     lastRecognitionActivity = Date.now();
-
-    // Only take the NEW results (from resultIndex) — stale fragments otherwise.
     let transcript = '';
     for (let i = event.resultIndex; i < event.results.length; i++) {
       if (event.results[i].isFinal) {
@@ -571,18 +757,6 @@ async function startAgent() {
 
     console.log('User:', transcript);
 
-    // Echo guard: the agent's own TTS (through the speakers) can be transcribed
-    // by the recognizer even when echo cancellation keeps our RMS gate quiet —
-    // e.g. "Nia followed the melody" came back as "follow the memory". A real
-    // user turn ALWAYS trips the barge-in pause first; a transcript that arrives
-    // while the agent is talking and no pause ever happened is echo.
-    //
-    // BUG FIX: after a barge-in, there's a race between the silence-resume timer
-    // (which clears tentativePause) and onresult firing with the user's transcript.
-    // If onresult fires after the resume, the naive guard above would wrongly treat
-    // the user's speech as echo. To prevent this, we skip the guard entirely for a
-    // grace window after any barge-in pause — the recognizer is finalizing the
-    // user's speech, not transcribing the agent's TTS.
     const recentlyBargedIn = Date.now() - lastBargeInAt < BARGE_IN_ECHO_GRACE_MS;
     if (isAgentSpeaking() && !state.tentativePause && !recentlyBargedIn) {
       console.log('🔇 Ignoring likely echo of agent speech:', transcript);
@@ -590,116 +764,17 @@ async function startAgent() {
       return;
     }
 
-    // Offload the async work (don't await — see note above).
     handleTurn(transcript);
   };
 
-  // Async part of turn handling — separated from onresult so the recognizer
-  // event handler returns immediately and stays responsive.
-  async function handleTurn(transcript) {
-    addMessage('user', transcript);
-
-    // Acknowledgment → continue the agent; real question → stop + answer.
-    if (isAcknowledgment(transcript)) {
-      console.log('🙂 Acknowledgment — agent continues speaking');
-      addEvent('🙂 — continuing');
-      resumeForAcknowledgment();
-      return;
-    }
-
-    // A real question/sentence: hard-stop the agent, clear everything, respond.
-    console.log('🗣 Real interruption — answering');
-    addEvent('🛑 Interrupted — answering you');
-    setStatus('Answering…');
-
-    // Snapshot BEFORE interruptPlayback() (it resets nextToPlay to 0). The
-    // deferred point is what the user has actually HEARD — played sentences —
-    // not what the LLM generated, which always runs ahead of playback.
-    const playedUpTo = state.playedUpTo;
-    const oldSentences = { ...state.sentenceTexts };
-
-    interruptPlayback();
-
-    const heard = [];
-    for (let i = 0; i <= playedUpTo; i++) {
-      if (oldSentences[i]) heard.push(oldSentences[i]);
-    }
-    // What the agent still owes the user: an earlier deferral that was never
-    // continued (survives multiple rapid interrupts), or what was just heard.
-    const interruptedContext = state.pendingDeferred || heard.join(' ');
-    state.pendingDeferred = interruptedContext; // cleared once it's been continued
-    state.sentenceTexts = {}; // fresh for the new response
-    if (interruptedContext) {
-      addEvent('📝 Will finish my earlier point after this');
-      console.log('📝 Deferred context:', interruptedContext.slice(0, 160));
-    }
-
-    let seq = 0;
-    const session = state.playbackSession;
-    state.responseFullyGenerated = false;
-    try {
-      // Phase 1 — answer the interruption ONLY (server prompt forbids
-      // resuming the earlier point here).
-      for await (const chunk of llmStreaming(transcript, interruptedContext)) {
-        // A newer turn took over → stop consuming this abandoned stream.
-        if (session !== state.playbackSession) break;
-        addMessage('agent', chunk.delta);
-        speak(chunk.delta, seq++);
-      }
-      // Phase 2 — DETERMINISTICALLY continue the deferred point, appended to
-      // the same playback queue. This is the guarantee the deferral works:
-      // it no longer depends on the model doing both parts in one response.
-      if (interruptedContext && session === state.playbackSession) {
-        addEvent('📝 Continuing my earlier point');
-        for await (const chunk of llmStreaming(
-          '(Continue exactly where you left off before my interruption.)',
-          interruptedContext,
-          'continue'
-        )) {
-          if (session !== state.playbackSession) break;
-          addMessage('agent', chunk.delta);
-          speak(chunk.delta, seq++);
-        }
-      }
-      // Generation finished. The drain loop may have exited while the last clips
-      // were still synthesizing — restart it so the tail always plays.
-      if (session === state.playbackSession) {
-        state.responseFullyGenerated = true;
-        drainQueue(session);
-        state.pendingDeferred = ''; // deferral delivered
-      }
-    } catch (err) {
-      // A dead stream (network drop, malformed SSE) must never leave the agent
-      // stuck in "Answering…" with no recovery path.
-      console.error('Turn handling error:', err);
-      if (session === state.playbackSession) {
-        addEvent('⚠️ Something went wrong — try again');
-        setStatus('Ready — tap the mic and talk');
-        state.responseFullyGenerated = true;
-        drainQueue(session);
-      }
-    }
-    setStatus('Agent speaking…');
-  }
-
-  // Chrome ends the recognition session after long silence — restart it.
-  // This is the critical keepalive: if start() throws (e.g. the previous
-  // session hasn't fully torn down after rapid restart cycles), retry after a
-  // short delay instead of letting recognition die silently.
-  //
-  // The watchdog below may also try to restart. To avoid both paths calling
-  // start() → InvalidStateError, whichever path is pending sets
-  // recognitionRestartPending and the other path skips.
   recognition.onend = function () {
     lastRecognitionActivity = Date.now();
     if (!running) return;
-    if (recognitionRestartPending) return; // watchdog owns the restart
+    if (recognitionRestartPending) return;
     try {
       recognition.start();
       console.log('🔄 Recognition restarted');
     } catch {
-      // start() can throw if the previous session hasn't fully torn down.
-      // Retry after a short delay instead of giving up.
       console.log('🔄 Recognition restart delayed, retrying…');
       recognitionRestartPending = true;
       setTimeout(() => {
@@ -724,33 +799,23 @@ async function startAgent() {
       addEvent('⚠️ Speech recognition blocked — allow mic access');
       stopAgent();
     }
-    // Other errors (e.g. 'no-speech', 'aborted') are transient — onend will
-    // fire next and trigger a restart, so we don't need to handle them here.
   };
 
-  recognition.start();
+  try {
+    recognition.start();
+  } catch {}
   lastRecognitionActivity = Date.now();
 
-  // Watchdog: if recognition has been silent for a while (no onresult, no onend
-  // restart) and the agent isn't speaking, the recognizer may have died without
-  // firing onerror. Force a restart.
-  //
-  // Uses recognitionRestartPending to avoid racing with the onend handler's
-  // own restart — only one path may own the restart at a time.
   recognitionWatchdog = setInterval(() => {
     if (!running) return;
-    if (recognitionRestartPending) return; // onend owns the restart
+    if (recognitionRestartPending) return;
     const idle = Date.now() - lastRecognitionActivity;
-    // Only act when the agent is not speaking — during a long response it's
-    // normal for the recognizer to be quiet.
     if (idle > 25000 && !isAgentSpeaking()) {
       console.log(`🔄 Watchdog: recognition idle for ${(idle / 1000).toFixed(0)}s, restarting`);
       recognitionRestartPending = true;
       try {
         recognition.stop();
-      } catch {
-        /* not running */
-      }
+      } catch {}
       setTimeout(() => {
         recognitionRestartPending = false;
         if (!running) return;
@@ -759,11 +824,16 @@ async function startAgent() {
           lastRecognitionActivity = Date.now();
         } catch (err) {
           console.error('Watchdog restart failed:', err);
-          // onend will fire from the failed start and handle the retry.
         }
       }, 300);
     }
   }, 10000);
+
+  // Greet immediately
+  const greeting = "Hi! I'm listening — ask me anything, and feel free to interrupt me.";
+  addMessage('agent', greeting);
+  setStatus('Agent speaking…');
+  speak(greeting, 0);
 }
 
 function stopAgent() {
@@ -777,30 +847,121 @@ function stopAgent() {
   if (recognition) {
     try {
       recognition.stop();
-    } catch {
-      /* already stopped */
-    }
+    } catch {}
   }
-  micBtn.classList.remove('listening');
+  if (micBtn) micBtn.classList.remove('listening');
   setStatus('Stopped — tap the mic to start again');
   addEvent('⏹ Session stopped');
 }
 
-// ---------------- wiring ----------------
+// ---------------- wiring & initialization ----------------
 if (isBrowser) {
-  micBtn.addEventListener('click', () => {
-    if (running) {
+  if (micBtn) {
+    micBtn.addEventListener('click', () => {
+      if (running) {
+        stopAgent();
+      } else {
+        startAgent();
+      }
+    });
+  }
+
+  if (loginForm) {
+    loginForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const key = (accessKeyInput?.value || '').trim();
+      if (!key) return;
+
+      const submitBtn = document.getElementById('loginSubmitBtn');
+      if (submitBtn) submitBtn.disabled = true;
+      if (loginError) loginError.style.display = 'none';
+
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          if (loginError) {
+            loginError.textContent = data.error || 'Invalid key';
+            loginError.style.display = 'block';
+          }
+          return;
+        }
+
+        authToken = data.token;
+        localStorage.setItem('va_token', data.token);
+        currentUserId = data.user;
+        if (userNameEl) userNameEl.textContent = currentUserId;
+        if (authBar) authBar.style.display = 'flex';
+        updateQuotaUI(data.tokensUsed, data.maxTokens);
+        hideAuthModal();
+        addEvent(`🔓 Signed in as ${currentUserId}`);
+
+        // Greet on first login
+        const greeting = "Hi! I'm listening — ask me anything, and feel free to interrupt me.";
+        addMessage('agent', greeting);
+        setStatus('Agent speaking…');
+        speak(greeting, 0);
+      } catch (err) {
+        if (loginError) {
+          loginError.textContent = `Login failed: ${err.message}`;
+          loginError.style.display = 'block';
+        }
+      } finally {
+        if (submitBtn) submitBtn.disabled = false;
+      }
+    });
+  }
+
+  if (logoutBtn) {
+    logoutBtn.addEventListener('click', () => {
       stopAgent();
-    } else {
-      startAgent();
-    }
-  });
+      authToken = null;
+      currentUserId = null;
+      localStorage.removeItem('va_token');
+      if (authBar) authBar.style.display = 'none';
+      showAuthModal();
+      setStatus('Signed out — enter access key to start');
+      addEvent('🔒 Signed out');
+    });
+  }
+
+  if (switchKeyBtn) {
+    switchKeyBtn.addEventListener('click', () => {
+      hideQuotaModal();
+      authToken = null;
+      currentUserId = null;
+      localStorage.removeItem('va_token');
+      if (authBar) authBar.style.display = 'none';
+      showAuthModal();
+    });
+  }
+
+  if (textForm && textInput) {
+    textForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const val = textInput.value.trim();
+      if (!val) return;
+      if (!authToken) {
+        showAuthModal();
+        return;
+      }
+      if (tokensUsed >= maxTokens) {
+        showQuotaModal();
+        return;
+      }
+      textInput.value = '';
+      handleTurn(val);
+    });
+  }
+
+  verifyAuthSession();
 }
 
 // Exports let bargeIn.test.js exercise the pure timing rules in Node.
 if (typeof module !== 'undefined') {
   module.exports = { bargeInTimingAction, BARGE_IN };
 }
-
-
-
