@@ -1,7 +1,13 @@
-# 🎙️ Voice Agent
+# 🎙️ Interruption-Aware Real-Time Voice Agent
 
-A hands-free voice assistant you can **interrupt like a human**: click the mic, talk, and
-the agent pauses when you speak, answers your question, then finishes what it was saying.
+[![Live Demo](https://img.shields.io/badge/Live_Demo-voice.pipeline.vikastc.in-ff6b35?style=for-the-badge&logo=vercel)](https://voice.pipeline.vikastc.in/)
+[![Portfolio](https://img.shields.io/badge/Portfolio-vikastc.in-10b981?style=for-the-badge)](https://vikastc.in/)
+[![Node.js](https://img.shields.io/badge/Node.js-18+-green?style=flat-square&logo=node.js)](https://nodejs.org/)
+[![Express](https://img.shields.io/badge/Express-4-black?style=flat-square&logo=express)](https://expressjs.com/)
+[![OpenAI](https://img.shields.io/badge/OpenAI-Voice_SDK-412991?style=flat-square&logo=openai)](https://openai.com/)
+[![WebSockets](https://img.shields.io/badge/WebSockets-Realtime-blue?style=flat-square)](https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API)
+
+A hands-free, low-latency conversational voice agent you can **interrupt naturally like a human**: click the mic, speak, and the agent halts speech synthesis dynamically, answers your question, and smoothly recovers conversation state. Live at **[voice.pipeline.vikastc.in](https://voice.pipeline.vikastc.in/)**.
 
 A plain **Express** app — no framework-specific config. Works locally and deploys to
 Vercel (or any Node host) as-is.
