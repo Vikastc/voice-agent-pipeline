@@ -20,7 +20,7 @@ const state = {
 };
 
 const BARGE_IN = {
-  rmsThreshold: 0.04,     // mic level considered "loud"
+  rmsThreshold: 0.06,     // mic level considered "loud"
   consecutiveFrames: 3,   // ~50ms of loudness = a real sound → pause
   interruptAfterMs: 2500, // continuous speech past this = real interruption
   gapToleranceMs: 600,    // word gaps don't reset the burst clock
@@ -739,67 +739,86 @@ async function startAgent() {
     return;
   }
 
+  let consecutiveDeadRestarts = 0; // restarts with zero results → engine went deaf (Chrome bug)
+
+  function wireHandlers(rec) {
+    rec.onresult = function (event) {
+      lastRecognitionActivity = Date.now();
+      consecutiveDeadRestarts = 0;
+      let transcript = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        if (event.results[i].isFinal) {
+          transcript += event.results[i][0].transcript;
+        }
+      }
+      transcript = transcript.trim();
+      if (!transcript) return;
+
+      console.log('User:', transcript);
+
+      const recentlyBargedIn = Date.now() - lastBargeInAt < BARGE_IN_ECHO_GRACE_MS;
+      if (isAgentSpeaking() && !state.tentativePause && !recentlyBargedIn) {
+        console.log('🔇 Ignoring likely echo of agent speech:', transcript);
+        addEvent('🔇 (ignored my own voice)');
+        return;
+      }
+
+      handleTurn(transcript);
+    };
+
+    rec.onend = function () {
+      lastRecognitionActivity = Date.now();
+      if (!running) return;
+      if (recognitionRestartPending) return;
+
+      // Chrome bug: a long-lived SpeechRecognition instance can stop yielding
+      // results but keep firing onend. Restarting the same deaf instance in a
+      // tight loop never recovers — count dead restarts and rebuild the engine.
+      consecutiveDeadRestarts += 1;
+      const engineDeaf = consecutiveDeadRestarts >= 4;
+      recognitionRestartPending = true;
+
+      setTimeout(() => {
+        recognitionRestartPending = false;
+        if (!running) return;
+
+        if (engineDeaf) {
+          consecutiveDeadRestarts = 0;
+          console.log('♻️ Recognition went silent — rebuilding engine');
+          addEvent('♻️ Rebuilding listener…');
+          try { recognition.abort(); } catch {}
+          recognition = new SpeechRecognition();
+          recognition.continuous = true;
+          recognition.interimResults = false;
+          recognition.maxAlternatives = 1;
+          wireHandlers(recognition);
+        }
+
+        try {
+          recognition.start();
+          lastRecognitionActivity = Date.now();
+          console.log('🔄 Recognition restarted');
+        } catch (err) {
+          console.error('❌ Failed to restart recognition:', err);
+        }
+      }, engineDeaf ? 750 : 250);
+    };
+
+    rec.onerror = function (e) {
+      lastRecognitionActivity = Date.now();
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        addEvent('⚠️ Speech recognition blocked — allow mic access');
+        stopAgent();
+      }
+      // 'no-speech', 'audio-capture', 'network' are recoverable — onend restarts us
+    };
+  }
+
   recognition = new SpeechRecognition();
   recognition.continuous = true;
   recognition.interimResults = false;
   recognition.maxAlternatives = 1;
-
-  recognition.onresult = function (event) {
-    lastRecognitionActivity = Date.now();
-    let transcript = '';
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      if (event.results[i].isFinal) {
-        transcript += event.results[i][0].transcript;
-      }
-    }
-    transcript = transcript.trim();
-    if (!transcript) return;
-
-    console.log('User:', transcript);
-
-    const recentlyBargedIn = Date.now() - lastBargeInAt < BARGE_IN_ECHO_GRACE_MS;
-    if (isAgentSpeaking() && !state.tentativePause && !recentlyBargedIn) {
-      console.log('🔇 Ignoring likely echo of agent speech:', transcript);
-      addEvent('🔇 (ignored my own voice)');
-      return;
-    }
-
-    handleTurn(transcript);
-  };
-
-  recognition.onend = function () {
-    lastRecognitionActivity = Date.now();
-    if (!running) return;
-    if (recognitionRestartPending) return;
-    try {
-      recognition.start();
-      console.log('🔄 Recognition restarted');
-    } catch {
-      console.log('🔄 Recognition restart delayed, retrying…');
-      recognitionRestartPending = true;
-      setTimeout(() => {
-        recognitionRestartPending = false;
-        if (!running) return;
-        try {
-          recognition.start();
-          lastRecognitionActivity = Date.now();
-          console.log('🔄 Recognition restarted on retry');
-        } catch (err) {
-          console.error('❌ Failed to restart recognition:', err);
-          addEvent('⚠️ Mic stopped listening — tap the mic to restart');
-          stopAgent();
-        }
-      }, 500);
-    }
-  };
-
-  recognition.onerror = function (e) {
-    lastRecognitionActivity = Date.now();
-    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-      addEvent('⚠️ Speech recognition blocked — allow mic access');
-      stopAgent();
-    }
-  };
+  wireHandlers(recognition);
 
   try {
     recognition.start();
@@ -811,21 +830,11 @@ async function startAgent() {
     if (recognitionRestartPending) return;
     const idle = Date.now() - lastRecognitionActivity;
     if (idle > 25000 && !isAgentSpeaking()) {
-      console.log(`🔄 Watchdog: recognition idle for ${(idle / 1000).toFixed(0)}s, restarting`);
-      recognitionRestartPending = true;
+      console.log(`🔄 Watchdog: recognition idle for ${(idle / 1000).toFixed(0)}s — forcing rebuild`);
+      consecutiveDeadRestarts = 4; // next onend rebuilds a fresh engine
       try {
         recognition.stop();
       } catch {}
-      setTimeout(() => {
-        recognitionRestartPending = false;
-        if (!running) return;
-        try {
-          recognition.start();
-          lastRecognitionActivity = Date.now();
-        } catch (err) {
-          console.error('Watchdog restart failed:', err);
-        }
-      }, 300);
     }
   }, 10000);
 
